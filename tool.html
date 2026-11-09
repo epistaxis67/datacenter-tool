@@ -37,7 +37,7 @@
   .msg { font-size:12px; color:var(--dim); margin-top:8px; min-height:1.5em; } .msg.err { color:var(--red); }
   .info { margin-top:28px; font-size:12px; color:var(--dim); border-top:1px solid var(--line); padding:14px 0 0 18px; }
   .info li { margin:4px 0; }
-  video.src { position:absolute; width:1px; height:1px; opacity:0; pointer-events:none; }
+  video.src { position:fixed; left:0; bottom:0; width:2px; height:2px; opacity:.01; pointer-events:none; }
   [hidden] { display:none !important; }
   @media (max-width:560px) { .vars { grid-template-columns:repeat(3,1fr); } }
 </style>
@@ -64,6 +64,7 @@
   <div class="row">
     <button class="go" id="go" disabled>VIDEO ERSTELLEN</button>
     <a class="dl" id="dl" hidden download>⬇ VIDEO SPEICHERN</a>
+    <button class="dl" id="share" hidden>TEILEN / IN FOTOS</button>
   </div>
   <div class="bar"><i id="bar"></i></div>
   <div class="msg" id="msg">Noch kein Video gewählt. Die Vorschau zeigt einen Platzhalter.</div>
@@ -81,6 +82,7 @@
     <li>Die Bearbeitung dauert so lange wie das Video. Fenster währenddessen offen und sichtbar lassen.</li>
     <li>Ergebnis: MP4 mit Originalton, höchstens 1080 × 1920 (Hochformat) bzw. 1920 × 1080 (Querformat).</li>
     <li>Am besten in Chrome oder Safari. Firefox speichert nur WebM, das nimmt Instagram nicht.</li>
+    <li>Am iPhone: Link in Safari öffnen, Video aus „Fotos“ wählen, während der Bearbeitung nicht die App wechseln, danach „Teilen“ → „Video sichern“.</li>
     <li>Die Schrift ist Futura (auf jedem Mac vorhanden). Auf Windows erscheint eine ähnliche Ersatzschrift.</li>
   </ul>
 </main>
@@ -571,7 +573,7 @@ function ready() { $("go").disabled = !file || busy; }
 function load(f) {
   if (!f || !f.type.startsWith("video")) { msg("Bitte eine Videodatei wählen.", true); return; }
   file = f; still = null; $("dl").hidden = true; $("out").hidden = true; cv.hidden = false; $("bar").style.width = "0";
-  src.src = URL.createObjectURL(f);
+  src.src = URL.createObjectURL(f); src.load();
   src.onloadedmetadata = () => {
     let w = src.videoWidth, h = src.videoHeight;
     const k = Math.min(1920 / Math.max(w, h), 1080 / Math.min(w, h));   // auf Instagram-Größe
@@ -593,54 +595,79 @@ drop.ondragover = e => { e.preventDefault(); drop.classList.add("over"); };
 drop.ondragleave = () => drop.classList.remove("over");
 drop.ondrop = e => { e.preventDefault(); drop.classList.remove("over"); load(e.dataTransfer.files[0]); };
 
-/* Aufnahme */
+/* Aufnahme
+   iPhone/Safari: Abspielen mit Ton ist nur direkt im Tipp erlaubt. Darum startet hier alles
+   ohne ein einziges „await“: Audio, Aufnahme und Wiedergabe beginnen im selben Moment. */
 function pickMime() {
   const c = ["video/mp4;codecs=avc1.640028,mp4a.40.2", "video/mp4;codecs=avc1,mp4a", "video/mp4", "video/webm;codecs=vp9,opus", "video/webm"];
-  return c.find(m => window.MediaRecorder && MediaRecorder.isTypeSupported(m)) || "";
+  return c.find(m => window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(m)) || "";
 }
-let actx = null, adest = null;
-$("go").onclick = async () => {
+let actx = null, adest = null, result = null;
+function finishUI() { busy = false; ready(); [...$("vars").children].forEach(b => b.disabled = false); }
+$("go").onclick = () => {
+  if (!window.MediaRecorder || !cv.captureStream) { msg("Dieser Browser kann kein Video aufnehmen. Am iPhone bitte Safari ab iOS 15, sonst Chrome oder Safari am Rechner.", true); return; }
   const mime = pickMime();
   if (!mime) { msg("Dieser Browser kann kein Video aufnehmen. Bitte Chrome oder Safari nutzen.", true); return; }
   busy = true; ready(); [...$("vars").children].forEach(b => b.disabled = true);
-  $("dl").hidden = true; $("out").hidden = true; cv.hidden = false;
+  $("dl").hidden = true; $("share").hidden = true; $("out").hidden = true; cv.hidden = false;
   const W = cv.width, H = cv.height, D = src.duration, c = clip.getContext("2d");
-  if (!actx) {                                      // Ton in die Aufnahme leiten, nicht auf die Lautsprecher
-    actx = new (window.AudioContext || window.webkitAudioContext)();
-    const a = actx.createMediaElementSource(src); adest = actx.createMediaStreamDestination(); a.connect(adest);
-  }
-  await actx.resume();
-  const stream = cv.captureStream(30);
-  adest.stream.getAudioTracks().forEach(t => stream.addTrack(t));
-  const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 12e6, audioBitsPerSecond: 192e3 });
+  let stream, rec;
+  try {
+    if (!actx) {                                    // Ton in die Aufnahme leiten, nicht auf die Lautsprecher
+      actx = new (window.AudioContext || window.webkitAudioContext)();
+      const a = actx.createMediaElementSource(src); adest = actx.createMediaStreamDestination(); a.connect(adest);
+    }
+    actx.resume();
+    stream = cv.captureStream(30);
+    adest.stream.getAudioTracks().forEach(t => stream.addTrack(t));
+    rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 10e6, audioBitsPerSecond: 160e3 });
+  } catch (e) { msg("Aufnahme lässt sich nicht starten: " + e.message, true); finishUI(); return; }
   const chunks = []; rec.ondataavailable = e => e.data.size && chunks.push(e.data);
-  src.pause(); src.currentTime = 0;
-  await new Promise(r => { src.onseeked = () => { src.onseeked = null; r(); }; });
+  rec.onerror = e => msg("Fehler bei der Aufnahme: " + (e.error && e.error.message || "unbekannt"), true);
   let done = false;
-  const draw = tr => { c.drawImage(src, 0, 0, W, H); render(phaseTime(tr, D), tr); };
+  const draw = tr => { if (src.readyState >= 2) c.drawImage(src, 0, 0, W, H); render(phaseTime(tr, D), tr); };
   const paint = () => {
     if (done) return;
     draw(src.currentTime);
     $("bar").style.width = (src.currentTime / D * 100) + "%";
     if (src.requestVideoFrameCallback) src.requestVideoFrameCallback(paint); else requestAnimationFrame(paint);
   };
+  src.pause(); src.currentTime = 0;
   draw(0); rec.start(250);
-  msg("Läuft … Fenster offen und sichtbar lassen.");
-  try { await src.play(); } catch (e) { msg("Abspielen blockiert: " + e.message, true); rec.stop(); busy = false; ready(); return; }
-  paint();
-  src.onended = () => { done = true; render(T, D); setTimeout(() => rec.stop(), 200); };
+  msg("Läuft … Fenster offen und sichtbar lassen, nicht die App wechseln.");
+  // Wächter: wenn das Video nach 6 s nicht vorankommt, sagen, woran es hängt
+  let lastT = -1, stuck = 0;
+  const watch = setInterval(() => {
+    if (done) { clearInterval(watch); return; }
+    if (src.currentTime === lastT) stuck++; else { stuck = 0; lastT = src.currentTime; }
+    if (stuck >= 6) {
+      clearInterval(watch); done = true; try { rec.stop(); } catch (e) {}
+      msg(`Das Video läuft nicht an (Status ${src.readyState}/${src.networkState}${src.error ? ", Fehler " + src.error.code : ""}). Bitte Seite neu laden und erneut versuchen.`, true);
+    }
+  }, 1000);
+  src.onended = () => { done = true; clearInterval(watch); render(T, D); setTimeout(() => rec.state !== "inactive" && rec.stop(), 200); };
   rec.onstop = () => {
+    stream.getVideoTracks().forEach(t => t.stop());
+    if (!chunks.length) { if (!$("msg").classList.contains("err")) msg("Es wurde nichts aufgenommen.", true); finishUI(); return; }
     const type = mime.split(";")[0], blob = new Blob(chunks, { type });
     const url = URL.createObjectURL(blob), ext = type.includes("mp4") ? "mp4" : "webm";
     const name = file.name.replace(/\.[^.]+$/, "") + "_datacenter_V" + (sel + 1) + "." + ext;
+    result = new File([blob], name, { type });
     const out = $("out"); out.src = url; out.hidden = false; cv.hidden = true;
     const dl = $("dl"); dl.href = url; dl.download = name; dl.hidden = false;
+    $("share").hidden = !(navigator.canShare && navigator.canShare({ files: [result] }));
     $("bar").style.width = "100%";
-    msg(ext === "mp4" ? `Fertig: ${name} (${(blob.size / 1e6).toFixed(1)} MB). Für eine andere Variante einfach umschalten und neu erstellen.` : "Fertig, aber als WebM. Für Instagram bitte Chrome oder Safari nutzen.", ext !== "mp4");
-    stream.getVideoTracks().forEach(t => t.stop());
-    busy = false; ready(); [...$("vars").children].forEach(b => b.disabled = false);
+    if (!$("msg").classList.contains("err") || ext === "mp4")
+      msg(ext === "mp4" ? `Fertig: ${name} (${(blob.size / 1e6).toFixed(1)} MB). Am iPhone: „Teilen“ → „Video sichern“.` : "Fertig, aber als WebM. Für Instagram bitte Chrome oder Safari nutzen.", ext !== "mp4");
+    finishUI();
   };
+  const p = src.play();                             // im Tipp starten (wichtig fürs iPhone)
+  if (p && p.then) p.then(paint).catch(e => { done = true; clearInterval(watch); try { rec.stop(); } catch (_) {} msg("Abspielen blockiert: " + e.message, true); });
+  else paint();
 };
+$("share").onclick = () => { if (result) navigator.share({ files: [result] }).catch(() => {}); };
+window.addEventListener("error", e => msg("Fehler: " + e.message, true));
+window.addEventListener("unhandledrejection", e => msg("Fehler: " + (e.reason && e.reason.message || e.reason), true));
 // Nach dem Ergebnis zurück zur Vorschau, sobald man die Variante wechselt
 $("vars").addEventListener("click", () => { if (!busy) { $("out").hidden = true; cv.hidden = false; } });
 
